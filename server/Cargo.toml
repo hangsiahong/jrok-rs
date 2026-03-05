@@ -1,0 +1,39 @@
+[package]
+name = "jrok"
+version = "0.1.0"
+edition = "2021"
+default-run = "jrok-server"
+
+[[bin]]
+name = "jrok-server"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+libsql = "0.3"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "1"
+anyhow = "1"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+rand = "0.8"
+bytes = "1"
+
+[workspace]
+members = ["cli"]
