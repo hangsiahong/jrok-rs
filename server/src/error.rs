@@ -20,6 +20,9 @@ pub enum Error {
     #[error("Bad request: {0}")]
     BadRequest(String),
 
+    #[error("Validation error: {0}")]
+    Validation(String),
+
     #[error("Invalid API key")]
     InvalidApiKey,
 

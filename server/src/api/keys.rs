@@ -1,12 +1,11 @@
-// API routes - TEMPORARILY DISABLED due to axum version conflict
-// This code will be re-enabled when we resolve the libsql/tonic dependency issue
-// The database functions in db/mod.rs are still used for authentication
+// API key management endpoints
 
-/*
-use axum::response::Json;
+use axum::{extract::{Path, State}, response::Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::agent::AgentRegistry;
+use crate::cluster::Cluster;
 use crate::db::Db;
 use crate::error::Result;
 
@@ -38,14 +37,16 @@ pub struct ApiKeyInfo {
 }
 
 pub async fn create_api_key(
-    State(db): State<Arc<Db>>,
+    State((_registry, db, _cluster)): State<(Arc<AgentRegistry>, Arc<Db>, Arc<Cluster>)>,
     Json(req): Json<CreateApiKeyRequest>,
 ) -> Result<Json<ApiKeyResponse>> {
     let id = uuid::Uuid::new_v4().to_string();
     let key = format!("jrok_{}", uuid::Uuid::new_v4());
-    let key_prefix = key.chars().take(8).collect();
+    let key_prefix: String = key.chars().take(8).collect();
 
     let api_key = db.create_api_key(&id, &key, Some(&req.name)).await?;
+
+    tracing::info!("Created API key: {} ({})", api_key.key_prefix, req.name);
 
     Ok(Json(ApiKeyResponse {
         id: api_key.id,
@@ -57,7 +58,7 @@ pub async fn create_api_key(
 }
 
 pub async fn list_api_keys(
-    State(db): State<Arc<Db>>,
+    State((_registry, db, _cluster)): State<(Arc<AgentRegistry>, Arc<Db>, Arc<Cluster>)>,
 ) -> Result<Json<ApiKeyListResponse>> {
     let keys = db.list_api_keys().await?;
 
@@ -75,15 +76,16 @@ pub async fn list_api_keys(
 }
 
 pub async fn delete_api_key(
-    State(db): State<Arc<Db>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
+    State((_registry, db, _cluster)): State<(Arc<AgentRegistry>, Arc<Db>, Arc<Cluster>)>,
+    Path(id): Path<String>,
 ) -> Result<&'static str> {
     db.delete_api_key(&id).await?;
+    tracing::info!("Deleted API key: {}", id);
     Ok("API key deleted")
 }
 
 pub async fn validate_api_key_direct(
-    State(db): State<Arc<Db>>,
+    State((_registry, db, _cluster)): State<(Arc<AgentRegistry>, Arc<Db>, Arc<Cluster>)>,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<bool>> {
     let key = req.get("key")
@@ -93,4 +95,3 @@ pub async fn validate_api_key_direct(
     let valid = db.validate_api_key(key).await?;
     Ok(Json(valid))
 }
-*/

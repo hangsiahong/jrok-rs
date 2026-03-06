@@ -1,6 +1,7 @@
 mod models;
 
 pub use models::*;
+pub use libsql;
 
 use crate::error::{Error, Result};
 use libsql::{params, Connection, Builder};

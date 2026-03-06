@@ -111,16 +111,34 @@ async fn handle_agent_connection(socket: WebSocket, registry: Arc<registry::Agen
             Ok(Message::TcpConnect { connection_id, client_ip }) => {
                 if let Some(ref id) = agent_id {
                     debug!("Agent {} TCP connect: {} from {}", id, connection_id, client_ip);
+                    // Forward connection request to agent via msg_tx
+                    let connect_msg = Message::TcpConnect {
+                        connection_id: connection_id.clone(),
+                        client_ip,
+                    };
+                    let _ = msg_tx.send(connect_msg).await;
                 }
             }
-            Ok(Message::TcpData { connection_id, data: _data }) => {
-                if let Some(ref _id) = agent_id {
-                    debug!("TCP data for connection {}", connection_id);
+            Ok(Message::TcpData { connection_id, data }) => {
+                if let Some(ref id) = agent_id {
+                    debug!("Agent {} received TCP data: {} bytes", id, data.len());
+                    // Forward data back to the waiting TCP connection
+                    // This would typically be stored in a pending requests map
+                    use base64::Engine;
+                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&data) {
+                        // TODO: Forward decoded data to the actual TCP connection
+                        debug!("Forwarding {} bytes to TCP connection {}", decoded.len(), connection_id);
+                    }
                 }
             }
             Ok(Message::TcpDisconnect { connection_id }) => {
-                if let Some(ref _id) = agent_id {
-                    debug!("TCP disconnect for connection {}", connection_id);
+                if let Some(ref id) = agent_id {
+                    debug!("Agent {} TCP disconnect: {}", id, connection_id);
+                    // Forward disconnect message to agent
+                    let disconnect_msg = Message::TcpDisconnect {
+                        connection_id: connection_id.clone(),
+                    };
+                    let _ = msg_tx.send(disconnect_msg).await;
                 }
             }
             Ok(_) => {

@@ -15,7 +15,7 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 http-body-util = "0.1"
 
-libsql = "0.3"
+libsql = "0.5"
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
@@ -37,5 +37,9 @@ rand = "0.8"
 bytes = "1"
 dotenv = "0.15"
 
-[workspace]
-members = ["cli"]
+# TCP tunneling support
+rexpose = "1.2"
+
+[dev-dependencies]
+tokio-test = "0.4"
+reqwest = { version = "0.12", features = ["json"] }

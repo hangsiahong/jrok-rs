@@ -1,7 +1,7 @@
 mod agent;
 mod api;
 mod cluster;
-mod db;
+pub mod db;
 mod tunnel;
 mod proto;
 mod tcp;
@@ -40,8 +40,7 @@ async fn main() {
     cluster.start().await;
     info!("Cluster started");
 
-    // Note: API routes temporarily disabled due to axum version conflict
-    // from libsql/tonic dependency chain. Core authentication works.
+    // API routes disabled due to axum/libsql conflict - use CLI tool instead
     let app = Router::new()
         .route("/health", get(health))
         .route("/ws/agent", get(agent::handle_agent_ws))
