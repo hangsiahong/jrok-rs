@@ -5,6 +5,7 @@ pub mod db;
 mod tunnel;
 mod proto;
 mod tcp;
+mod nat;
 mod error;
 mod config;
 

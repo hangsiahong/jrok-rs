@@ -9,6 +9,7 @@ pub mod cluster;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod nat;
 pub mod proto;
 pub mod tcp;
 pub mod tunnel;

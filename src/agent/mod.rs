@@ -142,17 +142,21 @@ async fn handle_agent_connection(socket: WebSocket, registry: Arc<registry::Agen
                 }
             }
             // Connection facilitation messages
-            Ok(Message::TcpListenResponse { session_id, endpoint }) => {
+            Ok(Message::TcpListenResponse { session_id, endpoint, agent_nat }) => {
                 if let Some(ref id) = agent_id {
                     debug!("Agent {} listening at {} for session {}", id, endpoint, session_id);
-                    // Update TCP facilitator with agent's listening endpoint
-                    let _ = facilitator.agent_listening(&session_id, endpoint.clone()).await;
+
+                    // Convert NAT info from serializable format
+                    let nat_info = agent_nat.map(|nat| crate::nat::NatInfo::from(nat));
+
+                    // Update TCP facilitator with agent's listening endpoint and NAT info
+                    let _ = facilitator.agent_listening(&session_id, endpoint.clone(), nat_info).await;
                 }
             }
-            Ok(Message::ConnectionEstablished { session_id }) => {
+            Ok(Message::ConnectionEstablished { session_id, direct }) => {
                 if let Some(ref id) = agent_id {
-                    debug!("Agent {} confirmed connection for session {}", id, session_id);
-                    // Notify TCP facilitator that direct connection is established
+                    debug!("Agent {} confirmed connection for session {} (direct: {})", id, session_id, direct);
+                    // Notify TCP facilitator that connection is established
                     let _ = facilitator.client_connected(&session_id).await;
                 }
             }
