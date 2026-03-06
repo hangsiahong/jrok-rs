@@ -1,5 +1,11 @@
-// TCP tunneling implementation using rexpose
-// This module provides TCP forwarding capabilities through WebSocket agents
+// TCP tunneling via CONNECTION FACILITATION
+// This is NOT a TCP proxy - it's a signaling service like WebRTC
+//
+// Architecture:
+//   Client asks jrok → jrok finds agent → agent creates listener → agent reports public endpoint
+//   → jrok tells client → client connects DIRECTLY to agent (not through jrok)
+//
+// This scales to 10,000+ concurrent services because jrok is NOT in the data path
 
 use crate::agent::AgentRegistry;
 use crate::cluster::Cluster;
@@ -9,288 +15,304 @@ use crate::proto::Message;
 use axum::{
     extract::{Path, State},
     response::{IntoResponse, Response},
+    http::StatusCode,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-    sync::Mutex,
-};
-use tracing::{debug, error, info, warn};
+use tokio::sync::RwLock;
+use tracing::{debug, error, info};
 
-/// TCP forwarder that manages TCP tunnel connections
-pub struct TcpForwarder {
-    registry: Arc<AgentRegistry>,
-    active_listeners: Arc<Mutex<HashMap<String, u16>>>,
+/// Connection session tracks facilitation state
+#[derive(Debug, Clone)]
+pub struct ConnectionSession {
+    pub session_id: String,
+    pub subdomain: String,
+    pub client_addr: String,
+    pub agent_id: String,
+    pub agent_endpoint: Option<String>,
+    pub status: ConnectionStatus,
+    pub created_at: i64,
 }
 
-impl TcpForwarder {
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConnectionStatus {
+    Pending,        // Initial state
+    FindingAgent,   // Locating agent
+    Requesting,     // Asking agent to create listener
+    Ready,          // Agent ready, endpoint provided
+    Connected,      // Client connected directly to agent
+    Failed,         // Connection failed
+}
+
+/// Connection facilitator (NOT a proxy!)
+/// This helps clients and agents find each other, but doesn't proxy data
+pub struct ConnectionFacilitator {
+    registry: Arc<AgentRegistry>,
+    sessions: Arc<RwLock<HashMap<String, ConnectionSession>>>,
+}
+
+impl ConnectionFacilitator {
     pub fn new(registry: Arc<AgentRegistry>) -> Self {
         Self {
             registry,
-            active_listeners: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Start listening for TCP connections on behalf of an agent
-    pub async fn start_listener(&self, subdomain: String, port: u16) -> Result<()> {
-        self.active_listeners
-            .lock()
-            .await
-            .insert(subdomain.clone(), port);
-
-        info!("Started TCP listener for '{}' on port {}", subdomain, port);
-
-        Ok(())
-    }
-
-    /// Stop listening for TCP connections
-    pub async fn stop_listener(&self, subdomain: &str) -> Result<()> {
-        self.active_listeners.lock().await.remove(subdomain);
-        info!("Stopped TCP listener for '{}'", subdomain);
-        Ok(())
-    }
-}
-
-/// TCP connection manager that tracks active connections
-#[derive(Clone)]
-pub struct TcpConnectionManager {
-    connections: Arc<Mutex<HashMap<String, TcpConnection>>>,
-    registry: Arc<AgentRegistry>,
-}
-
-struct TcpConnection {
-    connection_id: String,
-    agent_id: String,
-    subdomain: String,
-    client_addr: String,
-}
-
-impl TcpConnectionManager {
-    pub fn new(registry: Arc<AgentRegistry>) -> Self {
-        Self {
-            connections: Arc::new(Mutex::new(HashMap::new())),
-            registry,
-        }
-    }
-
-    pub async fn create_connection(
+    /// Client requests connection to a service
+    /// This does NOT proxy data - it just helps establish the connection
+    pub async fn request_connection(
         &self,
-        connection_id: String,
-        agent_id: String,
         subdomain: String,
         client_addr: String,
-    ) {
-        let connection = TcpConnection {
-            connection_id: connection_id.clone(),
-            agent_id,
-            subdomain,
-            client_addr,
+    ) -> Result<ConnectionSession> {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let now = std::time::SystemTime::UNIX_EPOCH
+            .elapsed()
+            .map_err(|e| crate::error::Error::Internal(format!("Time error: {}", e)))
+            .unwrap()
+            .as_millis() as i64;
+
+        // Find agent
+        let (agent_id, agent) = self.registry.get_by_subdomain(&subdomain)
+            .await
+            .ok_or_else(|| crate::error::Error::TunnelNotFound(subdomain.clone()))?;
+
+        if agent.protocol != crate::db::Protocol::Tcp {
+            return Err(crate::error::Error::BadRequest(
+                "Agent is not configured for TCP".to_string()
+            ));
+        }
+
+        let session = ConnectionSession {
+            session_id: session_id.clone(),
+            subdomain: subdomain.clone(),
+            client_addr: client_addr.clone(),
+            agent_id: agent_id.clone(),
+            agent_endpoint: None,
+            status: ConnectionStatus::FindingAgent,
+            created_at: now,
         };
 
-        self.connections
-            .lock()
-            .await
-            .insert(connection_id.clone(), connection);
+        self.sessions.write().await.insert(session_id.clone(), session.clone());
 
-        debug!("TCP connection created: {}", connection_id);
+        // Ask agent to create listener and report endpoint
+        let msg = Message::TcpListenRequest {
+            session_id: session_id.clone(),
+        };
+
+        self.registry.send_message(&agent_id, msg).await?;
+
+        info!(
+            "Connection facilitation requested: {} -> {} (session: {})",
+            subdomain, agent_id, session_id
+        );
+
+        Ok(session)
     }
 
-    pub async fn remove_connection(&self, connection_id: &str) {
-        self.connections.lock().await.remove(connection_id);
-        debug!("TCP connection removed: {}", connection_id);
-    }
+    /// Agent reports its listening endpoint
+    pub async fn agent_listening(
+        &self,
+        session_id: &str,
+        agent_endpoint: String,
+    ) -> Result<()> {
+        let mut sessions = self.sessions.write().await;
 
-    pub async fn forward_data(&self, connection_id: &str, data: Vec<u8>) -> Result<()> {
-        let connections = self.connections.lock().await;
-        if let Some(conn) = connections.get(connection_id) {
-            // Send data to agent via WebSocket
-            use base64::Engine;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
-            let msg = Message::TcpData {
-                connection_id: connection_id.to_string(),
-                data: encoded,
-            };
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.agent_endpoint = Some(agent_endpoint.clone());
+            session.status = ConnectionStatus::Ready;
 
-            self.registry.send_message(&conn.agent_id, msg).await?;
+            info!(
+                "Agent listening for session {}: {}",
+                session_id, agent_endpoint
+            );
+            Ok(())
+        } else {
+            Err(crate::error::Error::BadRequest(
+                "Session not found".to_string()
+            ))
         }
+    }
+
+    /// Client signals successful connection to agent
+    pub async fn client_connected(
+        &self,
+        session_id: &str,
+    ) -> Result<()> {
+        let mut sessions = self.sessions.write().await;
+
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.status = ConnectionStatus::Connected;
+            info!(
+                "Direct connection established: {} -> {} (endpoint: {:?})",
+                session.subdomain, session.agent_id, session.agent_endpoint
+            );
+            Ok(())
+        } else {
+            Err(crate::error::Error::BadRequest(
+                "Session not found".to_string()
+            ))
+        }
+    }
+
+    /// Get session status
+    pub async fn get_session(&self, session_id: &str) -> Option<ConnectionSession> {
+        self.sessions.read().await.get(session_id).cloned()
+    }
+
+    /// Clean up old sessions
+    pub async fn cleanup_sessions(&self, timeout_ms: i64) -> Result<()> {
+        let now = std::time::SystemTime::UNIX_EPOCH
+            .elapsed()
+            .map_err(|e| crate::error::Error::Internal(format!("Time error: {}", e)))
+            .unwrap()
+            .as_millis() as i64;
+
+        let cutoff = now - timeout_ms;
+
+        let mut sessions = self.sessions.write().await;
+        let before = sessions.len();
+
+        sessions.retain(|_, session| session.created_at > cutoff);
+
+        let cleaned = before - sessions.len();
+        if cleaned > 0 {
+            info!("Cleaned up {} connection sessions", cleaned);
+        }
+
         Ok(())
+    }
+
+    /// Get active session count
+    pub async fn session_count(&self) -> usize {
+        self.sessions.read().await.len()
     }
 }
 
-/// Handle incoming TCP tunnel connection
-pub async fn handle_tcp_tunnel(
-    Path((subdomain, tcp_port)): Path<(String, u16)>,
-    State((registry, db, cluster)): State<(Arc<AgentRegistry>, Arc<Db>, Arc<Cluster>)>,
+/// HTTP endpoint for connection facilitation
+pub async fn handle_tcp_connection_request(
+    Path(subdomain): Path<String>,
+    State((registry, _db, _cluster, facilitator)): State<(Arc<AgentRegistry>, Arc<Db>, Arc<Cluster>, Arc<ConnectionFacilitator>)>,
+    addr: axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
-    debug!("TCP tunnel request for {} on port {}", subdomain, tcp_port);
+    let client_addr = addr.0.to_string();
 
-    // Check if agent exists
-    let Some((agent_id, agent)) = registry.get_by_subdomain(&subdomain).await else {
-        // Check if agent exists on remote server
-        if let Ok(Some(remote_server)) = db.get_agent_server(&subdomain).await {
-            // Agent exists on remote server
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                format!(
-                    "Agent '{}' is on remote server '{}'. Connect directly to that server.",
-                    subdomain, remote_server
-                ),
-            )
-                .into_response();
-        }
-
-        return (
-            axum::http::StatusCode::NOT_FOUND,
-            format!("Tunnel '{}' not found. No agent registered.", subdomain),
-        )
-            .into_response();
-    };
-
-    // Check if agent supports TCP
-    if agent.protocol != crate::db::Protocol::Tcp {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            "Agent is not configured for TCP tunneling. Use protocol='tcp' in registration.",
-        )
-            .into_response();
-    }
-
-    info!(
-        "TCP tunnel established: {} -> {}:{} (agent: {})",
-        subdomain, agent.local_host, agent.local_port, agent_id
+    debug!(
+        "TCP connection request from {} for service '{}'",
+        client_addr, subdomain
     );
 
-    // The actual TCP forwarding will be handled by TcpForwarder
-    // This is just the initial connection setup
-    (
-        axum::http::StatusCode::OK,
-        format!(
-            "TCP tunnel ready for '{}' on port {}. Agent: {}",
-            subdomain, tcp_port, agent_id
-        ),
-    )
-        .into_response()
-}
+    // Find agent
+    match facilitator.request_connection(subdomain, client_addr).await {
+        Ok(session) => {
+            // Return session info to client
+            // The client will poll for agent endpoint
+            let response = serde_json::json!({
+                "session_id": session.session_id,
+                "status": "pending",
+                "message": "Agent is preparing connection. Poll /tcp/session/{session_id} for status.",
+                "poll_url": format!("/tcp/session/{}", session.session_id)
+            });
 
-/// TCP forwarder that handles bidirectional data flow
-impl TcpForwarder {
-    pub async fn start_tcp_listener(
-        &self,
-        port: u16,
-        subdomain: String,
-    ) -> Result<()> {
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-        info!("TCP listener started on port {} for {}", port, subdomain);
-
-        let connection_manager = TcpConnectionManager::new(self.registry.clone());
-        let registry = self.registry.clone();
-
-        tokio::spawn(async move {
-            while let Ok((mut socket, addr)) = listener.accept().await {
-                let connection_id = uuid::Uuid::new_v4().to_string();
-                let subdomain = subdomain.clone();
-                let registry = registry.clone();
-                let conn_mgr = connection_manager.clone();
-
-                debug!(
-                    "TCP connection accepted: {} from {}",
-                    connection_id, addr
-                );
-
-                tokio::spawn(async move {
-                    // Find agent for this subdomain
-                    if let Some((agent_id, _agent)) =
-                        registry.get_by_subdomain(&subdomain).await
-                    {
-                        let agent_id_clone = agent_id.clone();
-
-                        // Notify agent of new connection
-                        let msg = Message::TcpConnect {
-                            connection_id: connection_id.clone(),
-                            client_ip: addr.to_string(),
-                        };
-
-                        if let Err(e) = registry.send_message(&agent_id, msg).await {
-                            error!("Failed to send TCP connect message: {}", e);
-                            return;
-                        }
-
-                        conn_mgr
-                            .create_connection(
-                                connection_id.clone(),
-                                agent_id,
-                                subdomain,
-                                addr.to_string(),
-                            )
-                            .await;
-
-                        // Handle data forwarding
-                        let mut buffer = [0u8; 4096];
-                        loop {
-                            match socket.read(&mut buffer).await {
-                                Ok(0) => {
-                                    // Connection closed
-                                    debug!("TCP connection closed: {}", connection_id);
-                                    break;
-                                }
-                                Ok(n) => {
-                                    let data = buffer[..n].to_vec();
-
-                                    // Forward data to agent
-                                    if let Err(e) = conn_mgr.forward_data(&connection_id, data).await {
-                                        error!("Failed to forward TCP data: {}", e);
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("TCP read error: {}", e);
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Notify agent of disconnect
-                        let msg = Message::TcpDisconnect {
-                            connection_id: connection_id.clone(),
-                        };
-
-                        if let Err(e) = registry.send_message(&agent_id_clone, msg).await {
-                            error!("Failed to send TCP disconnect message: {}", e);
-                        }
-
-                        conn_mgr.remove_connection(&connection_id).await;
-                    } else {
-                        warn!("No agent found for subdomain: {}", subdomain);
-                    }
-                });
-            }
-        });
-
-        Ok(())
-    }
-}
-
-/// Allocate a TCP port for tunneling
-pub async fn allocate_tcp_port(
-    db: &Db,
-    server_id: &str,
-    tunnel_id: &str,
-    start_port: u16,
-    end_port: u16,
-) -> Result<u16> {
-    for port in start_port..end_port {
-        match db.allocate_tcp_port(tunnel_id, server_id, start_port, end_port).await {
-            Ok(Some(tcp_port)) => return Ok(tcp_port.port),
-            Ok(None) => continue,
-            Err(_) => continue,
+            (StatusCode::ACCEPTED, axum::Json(response)).into_response()
+        }
+        Err(e) => {
+            (StatusCode::NOT_FOUND, format!("Service not found: {}", e)).into_response()
         }
     }
-    Err(crate::error::Error::NoTcpPort)
 }
 
-/// Deallocate a TCP port
-pub async fn deallocate_tcp_port(db: &Db, port: u16) -> Result<()> {
-    db.deallocate_tcp_port(port).await
+/// Get session status (client polls this)
+pub async fn get_session_status(
+    Path(session_id): Path<String>,
+    State((_registry, _db, _cluster, facilitator)): State<(Arc<AgentRegistry>, Arc<Db>, Arc<Cluster>, Arc<ConnectionFacilitator>)>,
+) -> Response {
+    match facilitator.get_session(&session_id).await {
+        Some(session) => {
+            let response = match session.status {
+                ConnectionStatus::Pending | ConnectionStatus::FindingAgent | ConnectionStatus::Requesting => {
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "status": "pending",
+                        "message": "Waiting for agent..."
+                    })
+                }
+                ConnectionStatus::Ready => {
+                    if let Some(endpoint) = &session.agent_endpoint {
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "status": "ready",
+                            "agent_endpoint": endpoint,
+                            "message": "Connect directly to this endpoint",
+                            "instruction": format!("Connect directly to: {}", endpoint)
+                        })
+                    } else {
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "status": "pending",
+                            "message": "Agent endpoint not yet available"
+                        })
+                    }
+                }
+                ConnectionStatus::Connected => {
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "status": "connected",
+                        "agent_endpoint": session.agent_endpoint,
+                        "message": "Connection established successfully"
+                    })
+                }
+                ConnectionStatus::Failed => {
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "status": "failed",
+                        "message": "Connection failed"
+                    })
+                }
+            };
+
+            axum::Json(response).into_response()
+        }
+        None => {
+            (StatusCode::NOT_FOUND, "Session not found or expired").into_response()
+        }
+    }
+}
+
+/// Agent reports it's listening (called by agent via WebSocket)
+pub async fn agent_listening(
+    State((_registry, _db, _cluster, facilitator)): State<(Arc<AgentRegistry>, Arc<Db>, Arc<Cluster>, Arc<ConnectionFacilitator>)>,
+    axum::extract::Json(request): axum::Json<AgentListeningRequest>,
+) -> Response {
+    match facilitator.agent_listening(&request.session_id, request.endpoint.clone()).await {
+        Ok(()) => {
+            info!("Agent {} listening at {}", request.session_id, request.endpoint);
+            (StatusCode::OK, "Listening recorded").into_response()
+        }
+        Err(e) => {
+            error!("Failed to record agent listening: {}", e);
+            (StatusCode::NOT_FOUND, format!("Session not found: {}", e)).into_response()
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AgentListeningRequest {
+    pub session_id: String,
+    pub endpoint: String,
+}
+
+/// Cleanup old sessions (called periodically)
+pub async fn cleanup_old_sessions(
+    State((_registry, _db, _cluster, facilitator)): State<(Arc<AgentRegistry>, Arc<Db>, Arc<Cluster>, Arc<ConnectionFacilitator>)>,
+) -> String {
+    match facilitator.cleanup_sessions(300_000).await {
+        Ok(_) => {
+            "Session cleanup completed".to_string()
+        }
+        Err(e) => {
+            format!("Cleanup error: {}", e)
+        }
+    }
 }

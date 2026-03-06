@@ -16,12 +16,12 @@ use std::pin::pin;
 
 pub async fn handle_agent_ws(
     ws: WebSocketUpgrade,
-    State((registry, db, _cluster)): State<(Arc<registry::AgentRegistry>, Arc<Db>, Arc<Cluster>)>,
+    State((registry, db, _cluster, facilitator)): State<(Arc<registry::AgentRegistry>, Arc<Db>, Arc<Cluster>, Arc<crate::tcp::ConnectionFacilitator>)>,
 ) -> Response {
-    ws.on_upgrade(|socket| handle_agent_connection(socket, registry, db))
+    ws.on_upgrade(|socket| handle_agent_connection(socket, registry, db, facilitator))
 }
 
-async fn handle_agent_connection(socket: WebSocket, registry: Arc<registry::AgentRegistry>, db: Arc<Db>) {
+async fn handle_agent_connection(socket: WebSocket, registry: Arc<registry::AgentRegistry>, db: Arc<Db>, facilitator: Arc<crate::tcp::ConnectionFacilitator>) {
     let (mut tx, rx) = socket.split();
     
     let mut agent_id: Option<String> = None;
@@ -139,6 +139,21 @@ async fn handle_agent_connection(socket: WebSocket, registry: Arc<registry::Agen
                         connection_id: connection_id.clone(),
                     };
                     let _ = msg_tx.send(disconnect_msg).await;
+                }
+            }
+            // Connection facilitation messages
+            Ok(Message::TcpListenResponse { session_id, endpoint }) => {
+                if let Some(ref id) = agent_id {
+                    debug!("Agent {} listening at {} for session {}", id, endpoint, session_id);
+                    // Update TCP facilitator with agent's listening endpoint
+                    let _ = facilitator.agent_listening(&session_id, endpoint.clone()).await;
+                }
+            }
+            Ok(Message::ConnectionEstablished { session_id }) => {
+                if let Some(ref id) = agent_id {
+                    debug!("Agent {} confirmed connection for session {}", id, session_id);
+                    // Notify TCP facilitator that direct connection is established
+                    let _ = facilitator.client_connected(&session_id).await;
                 }
             }
             Ok(_) => {

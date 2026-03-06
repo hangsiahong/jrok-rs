@@ -15,7 +15,7 @@ use tracing::debug;
 
 pub async fn proxy_http(
     Path((subdomain, path)): Path<(String, String)>,
-    State((registry, db, cluster)): State<(Arc<AgentRegistry>, Arc<Db>, Arc<Cluster>)>,
+    State((registry, db, cluster, _facilitator)): State<(Arc<AgentRegistry>, Arc<Db>, Arc<Cluster>, Arc<crate::tcp::ConnectionFacilitator>)>,
     method: Method,
     headers: axum::http::HeaderMap,
     body: Body,

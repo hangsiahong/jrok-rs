@@ -40,6 +40,21 @@ pub enum Message {
 
     HeartbeatAck,
 
+    // Connection facilitation messages (WebRTC-like signaling)
+    TcpListenRequest {
+        session_id: String,
+    },
+
+    TcpListenResponse {
+        session_id: String,
+        endpoint: String,  // Agent's public endpoint (ip:port)
+    },
+
+    ConnectionEstablished {
+        session_id: String,
+    },
+
+    // Legacy TCP proxying messages (deprecated, will be removed)
     TcpConnect {
         connection_id: String,
         client_ip: String,

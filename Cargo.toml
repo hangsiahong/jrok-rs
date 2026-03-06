@@ -37,8 +37,9 @@ rand = "0.8"
 bytes = "1"
 dotenv = "0.15"
 
-# TCP tunneling support
-rexpose = "1.2"
+# Connection facilitation & NAT traversal
+socket2 = "0.5"
+stun-client = "0.1"
 
 [dev-dependencies]
 tokio-test = "0.4"
