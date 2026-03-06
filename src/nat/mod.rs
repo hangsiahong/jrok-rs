@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 /// Check if IP address is private (RFC 1918)
-fn is_private_ip(ip: &std::net::IpAddr) -> bool {
+pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ipv4) => {
             let octets = ipv4.octets();

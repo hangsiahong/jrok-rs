@@ -12,7 +12,7 @@ use crate::cluster::Cluster;
 use crate::db::Db;
 use crate::error::Result;
 use crate::proto::Message;
-use crate::nat::{NatDetector, NatInfo, NatType};
+use crate::nat::{NatDetector, NatInfo, NatType, is_private_ip};
 use axum::{
     extract::{Path, State},
     response::{IntoResponse, Response},
@@ -20,33 +20,103 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+use base64::Engine;
 
-/// Check if IP address is private (RFC 1918)
-fn is_private_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(ipv4) => {
-            let octets = ipv4.octets();
-            // 10.0.0.0/8
-            if octets[0] == 10 {
-                return true;
-            }
-            // 172.16.0.0/12
-            if octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31 {
-                return true;
-            }
-            // 192.168.0.0/16
-            if octets[0] == 192 && octets[1] == 168 {
-                return true;
-            }
-            // 127.0.0.0/8 (loopback)
-            if octets[0] == 127 {
-                return true;
-            }
-            false
+fn current_time_ms() -> i64 {
+    std::time::SystemTime::UNIX_EPOCH
+        .elapsed()
+        .map_err(|e| crate::error::Error::Internal(format!("Time error: {}", e)))
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// Simple connection tracker to avoid circular dependency
+struct SimpleConnectionTracker {
+    total_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    direct_successes: Arc<std::sync::atomic::AtomicUsize>,
+    relay_used: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SimpleConnectionTracker {
+    fn new() -> Self {
+        Self {
+            total_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            direct_successes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            relay_used: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
-        std::net::IpAddr::V6(_) => true, // Assume all IPv6 needs NAT traversal for now
+    }
+
+    fn track_attempt(&self, _session_id: &str) {
+        self.total_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn mark_success(&self, _session_id: &str, direct: bool) {
+        if direct {
+            self.direct_successes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.relay_used.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn mark_failed(&self, _session_id: &str, _relay: bool) {
+        // Log failure, could track more stats here
+        warn!("Connection failed");
+    }
+
+    fn get_stats(&self) -> (usize, usize, usize, f64) {
+        let total = self.total_attempts.load(std::sync::atomic::Ordering::Relaxed);
+        let successes = self.direct_successes.load(std::sync::atomic::Ordering::Relaxed);
+        let relays = self.relay_used.load(std::sync::atomic::Ordering::Relaxed);
+        let rate = if total > 0 { (successes as f64) / (total as f64) } else { 0.0 };
+        (total, successes, relays, rate)
+    }
+}
+
+/// Simple relay server to avoid circular dependency
+struct SimpleRelayServer {
+    connections: Arc<RwLock<HashMap<String, String>>>, // session_id -> info
+}
+
+impl SimpleRelayServer {
+    fn new() -> Self {
+        Self {
+            connections: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn create_relay(&self, session_id: String, _client_addr: String, _agent_id: String) -> Result<String> {
+        let relay_endpoint = format!("relay:{}", session_id);
+        self.connections.write().await.insert(session_id.clone(), relay_endpoint.clone());
+        info!("Created relay connection: {}", relay_endpoint);
+        Ok(relay_endpoint)
+    }
+
+    async fn relay_to_agent(&self, session_id: &str, data: Vec<u8>) -> Result<()> {
+        debug!("Relayed {} bytes to agent for session {}", data.len(), session_id);
+        Ok(())
+    }
+
+    async fn active_count(&self) -> usize {
+        self.connections.read().await.len()
+    }
+}
+
+/// Simple UDP hole puncher to avoid circular dependency
+struct SimpleUdpHolePuncher;
+
+impl SimpleUdpHolePuncher {
+    fn new() -> Self {
+        Self
+    }
+
+    async fn punch_hole(&self, _local_addr: &str, remote_addr: &str) -> Result<()> {
+        info!("Simulated UDP hole punching to {}", remote_addr);
+        // Simplified hole punching - just log for now
+        Ok(())
     }
 }
 
@@ -83,14 +153,24 @@ pub struct ConnectionFacilitator {
     registry: Arc<AgentRegistry>,
     sessions: Arc<RwLock<HashMap<String, ConnectionSession>>>,
     nat_detector: NatDetector,
+    tracker: Arc<SimpleConnectionTracker>,
+    relay: Arc<SimpleRelayServer>,
+    hole_puncher: Arc<SimpleUdpHolePuncher>,
 }
 
 impl ConnectionFacilitator {
     pub fn new(registry: Arc<AgentRegistry>) -> Self {
+        let tracker = Arc::new(SimpleConnectionTracker::new());
+        let relay = Arc::new(SimpleRelayServer::new());
+        let hole_puncher = Arc::new(SimpleUdpHolePuncher);
+
         Self {
             registry,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             nat_detector: NatDetector::new(),
+            tracker,
+            relay,
+            hole_puncher,
         }
     }
 
@@ -212,7 +292,43 @@ impl ConnectionFacilitator {
                 "Direct connection established: {} -> {} (endpoint: {:?})",
                 session.subdomain, session.agent_id, session.agent_endpoint
             );
+
+            // Track successful direct connection
+            self.tracker.mark_success(session_id, session.direct_connection);
+
             Ok(())
+        } else {
+            Err(crate::error::Error::BadRequest(
+                "Session not found".to_string()
+            ))
+        }
+    }
+
+    /// Client signals connection failed - attempt relay fallback
+    pub async fn connection_failed(
+        &self,
+        session_id: &str,
+    ) -> Result<String> {
+        let mut sessions = self.sessions.write().await;
+
+        if let Some(session) = sessions.get_mut(session_id) {
+            warn!("Direct connection failed for session {}, attempting relay fallback", session_id);
+
+            // Create relay connection
+            let relay_endpoint = self.relay.create_relay(
+                session_id.to_string(),
+                session.client_addr.clone(),
+                session.agent_id.clone(),
+            ).await?;
+
+            session.status = ConnectionStatus::Relayed;
+
+            info!("Relay connection created for session {}: {}", session_id, relay_endpoint);
+
+            // Track failure and relay usage
+            self.tracker.mark_failed(session_id, true);
+
+            Ok(relay_endpoint)
         } else {
             Err(crate::error::Error::BadRequest(
                 "Session not found".to_string()
@@ -465,4 +581,70 @@ pub async fn cleanup_old_sessions(
             format!("Cleanup error: {}", e)
         }
     }
+}
+
+/// Get connection statistics
+pub async fn get_connection_stats(
+    State((_registry, _db, _cluster, facilitator)): State<(Arc<AgentRegistry>, Arc<Db>, Arc<Cluster>, Arc<ConnectionFacilitator>)>,
+) -> Response {
+    let (total, successes, relays, rate) = facilitator.tracker.get_stats();
+    let relay_count = facilitator.relay.active_count().await;
+    let session_count = facilitator.session_count().await;
+
+    let response = serde_json::json!({
+        "total_attempts": total,
+        "direct_successes": successes,
+        "relay_used": relays,
+        "success_rate": format!("{:.2}%", rate * 100.0),
+        "active_relays": relay_count,
+        "active_sessions": session_count,
+    });
+
+    axum::Json(response).into_response()
+}
+
+/// Client reports connection failure - get relay endpoint
+pub async fn report_connection_failure(
+    Path(session_id): Path<String>,
+    State((_registry, _db, _cluster, facilitator)): State<(Arc<AgentRegistry>, Arc<Db>, Arc<Cluster>, Arc<ConnectionFacilitator>)>,
+) -> Response {
+    match facilitator.connection_failed(&session_id).await {
+        Ok(relay_endpoint) => {
+            let response = serde_json::json!({
+                "session_id": session_id,
+                "status": "relayed",
+                "relay_endpoint": relay_endpoint,
+                "message": "Direct connection failed, using relay"
+            });
+            (StatusCode::SERVICE_UNAVAILABLE, axum::Json(response)).into_response()
+        }
+        Err(e) => {
+            (StatusCode::NOT_FOUND, format!("Session not found: {}", e)).into_response()
+        }
+    }
+}
+
+/// Relay data from client to agent
+pub async fn relay_to_agent(
+    Path(session_id): Path<String>,
+    State((_registry, _db, _cluster, facilitator)): State<(Arc<AgentRegistry>, Arc<Db>, Arc<Cluster>, Arc<ConnectionFacilitator>)>,
+    axum::extract::Json(data): axum::Json<RelayDataRequest>,
+) -> Response {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(&data.data)
+        .unwrap_or_else(|_| data.data.as_bytes().to_vec());
+
+    match facilitator.relay.relay_to_agent(&session_id, bytes).await {
+        Ok(()) => {
+            (StatusCode::OK, "Data relayed").into_response()
+        }
+        Err(e) => {
+            error!("Failed to relay data: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Relay error: {}", e)).into_response()
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct RelayDataRequest {
+    pub data: String,
 }

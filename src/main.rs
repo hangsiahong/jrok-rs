@@ -53,6 +53,10 @@ async fn main() {
         .route("/tcp/:subdomain", get(tcp::handle_tcp_connection_request))
         .route("/tcp/session/:session_id", get(tcp::get_session_status))
         .route("/agent/listening", post(tcp::agent_listening))
+        // Relay and statistics endpoints
+        .route("/tcp/session/:session_id/fail", post(tcp::report_connection_failure))
+        .route("/relay/:session_id/agent", post(tcp::relay_to_agent))
+        .route("/stats", get(tcp::get_connection_stats))
         .layer(CorsLayer::permissive())
         .with_state((agent_registry, db, cluster.clone(), tcp_facilitator));
 
