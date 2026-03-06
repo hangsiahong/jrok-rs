@@ -8,6 +8,7 @@ pub enum Message {
         local_port: u16,
         local_host: String,
         protocol: String,
+        api_key: String,
     },
 
     Welcome {

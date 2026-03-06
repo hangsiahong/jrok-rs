@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct ApiKey {
     pub id: String,
     pub key_hash: String,
@@ -27,6 +28,7 @@ pub struct ClusterState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct Tunnel {
     pub id: String,
     pub subdomain: String,
@@ -85,6 +87,7 @@ impl From<&str> for Protocol {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct TcpPort {
     pub port: u16,
     pub tunnel_id: String,

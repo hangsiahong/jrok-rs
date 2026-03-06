@@ -1,69 +1,74 @@
 mod agent;
+mod api;
 mod cluster;
 mod db;
 mod tunnel;
 mod proto;
+mod tcp;
 mod error;
 mod config;
 
-use axum::routing::get;
+use axum::routing::{any, get};
 use axum::Router;
 use std::sync::Arc;
-use tokio::signal;
+use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
-use tracing_subscriber::{layer::SubscriberExt, EnvFilter};
+use tracing::info;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
 async fn main() {
+    dotenv::dotenv().ok();
+
     tracing_subscriber::registry()
         .with(EnvFilter::from_default_env())
-        .finish();
+        .init();
     
     let config = config::Config::from_env();
-    
+
     info!("Starting jrok server {} on {}", config.server_id, config.http_host);
-    
+
     let db = db::Db::new(&config.turso_url, &config.turso_token).await.expect("Failed to connect to database");
     info!("Database connected");
-    
-    let cluster = cluster::Cluster::new(db.clone(), config.clone());
+
+    let agent_registry = agent::AgentRegistry::new(db.clone(), config.server_id.clone());
+    let agent_registry = Arc::new(agent_registry);
+    let db = Arc::new(db);
+
+    let cluster = cluster::Cluster::new(db.clone(), config.clone(), agent_registry.clone());
+    let cluster = Arc::new(cluster);
     cluster.start().await;
     info!("Cluster started");
-    
-    let agent_registry = agent::AgentRegistry::new(db.clone(), config.server_id.clone(), config.http_host.clone());
-    
-    let tunnel_router = tunnel::TunnelRouter::new(
-        agent_registry.clone(),
-        db.clone(),
-        config.clone(),
-    );
-    
+
+    // Note: API routes temporarily disabled due to axum version conflict
+    // from libsql/tonic dependency chain. Core authentication works.
     let app = Router::new()
         .route("/health", get(health))
         .route("/ws/agent", get(agent::handle_agent_ws))
         .route("/:subdomain/*path", any(tunnel::proxy_http))
         .layer(CorsLayer::permissive())
-        .with_state(tunnel_router);
-    
+        .with_state((agent_registry, db, cluster.clone()));
+
     let addr = format!("{}:{}", config.http_host, config.http_port);
-    
-    info!("Server listening on {}", addr);
-    
+    let listener = TcpListener::bind(&addr).await
+        .expect("Failed to bind to address");
+    info!("Server listening on {}", listener.local_addr()
+        .expect("Failed to get local address"));
+
     let shutdown_cluster = cluster.clone();
-    let shutdown_db = db.clone();
-    
+
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.unwrap();
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!("Failed to listen for shutdown signal: {}", e);
+        }
         info!("Shutting down...");
-        
+
         let _ = shutdown_cluster.shutdown().await;
-        let _ = shutdown_db.close().await;
     });
-    
-    axum::Server::bind(&addr.parse().unwrap())
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+
+    if let Err(e) = axum::serve(listener, app).await {
+        tracing::error!("Server error: {}", e);
+    }
 }
 
 async fn health() -> &'static str {

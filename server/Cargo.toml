@@ -10,9 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.7", features = ["ws", "macros"] }
+axum = { version = "0.7", features = ["ws"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
+http-body-util = "0.1"
 
 libsql = "0.3"
 hmac = "0.12"
@@ -34,6 +35,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 rand = "0.8"
 bytes = "1"
+dotenv = "0.15"
 
 [workspace]
 members = ["cli"]

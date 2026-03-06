@@ -1,3 +1,4 @@
+use crate::agent::AgentRegistry;
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::Result;
@@ -5,19 +6,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
-use tracing::{info, warn, error};
+use tracing::{info, error};
 
+#[derive(Clone)]
 pub struct Cluster {
-    db: Db,
+    db: Arc<Db>,
     config: Config,
+    agent_registry: Arc<AgentRegistry>,
     is_leader: Arc<AtomicBool>,
 }
 
 impl Cluster {
-    pub fn new(db: Db, config: Config) -> Self {
+    pub fn new(db: Arc<Db>, config: Config, agent_registry: Arc<AgentRegistry>) -> Self {
         Self {
             db,
             config,
+            agent_registry,
             is_leader: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -42,6 +46,7 @@ impl Cluster {
         tokio::spawn(Self::cleanup_loop(
             self.db.clone(),
             self.config.clone(),
+            self.agent_registry.clone(),
         ));
     }
     
@@ -51,7 +56,7 @@ impl Cluster {
         Ok(())
     }
     
-    async fn heartbeat_loop(db: Db, config: Config, is_leader: Arc<AtomicBool>) {
+    async fn heartbeat_loop(db: Arc<Db>, config: Config, is_leader: Arc<AtomicBool>) {
         let mut tick = interval(Duration::from_millis(config.heartbeat_interval_ms));
         
         loop {
@@ -62,7 +67,11 @@ impl Cluster {
                 continue;
             }
             
-            let now = std::time::SystemTime::UNIX_EPOCH.elapsed().unwrap().as_millis() as i64;
+            let now = std::time::SystemTime::UNIX_EPOCH
+                .elapsed()
+                .map_err(|e| crate::error::Error::Internal(format!("Time error: {}", e)))
+                .unwrap()
+                .as_millis() as i64;
             
             match db.get_cluster_state().await {
                 Ok(Some(state)) => {
@@ -115,19 +124,26 @@ impl Cluster {
         }
     }
     
-    async fn cleanup_loop(db: Db, config: Config) {
+    async fn cleanup_loop(db: Arc<Db>, config: Config, agent_registry: Arc<AgentRegistry>) {
         let mut tick = interval(Duration::from_secs(30));
-        
+
         loop {
             tick.tick().await;
-            
+
             if let Err(e) = db.mark_servers_unhealthy(config.leader_timeout_ms as u64).await {
                 error!("Failed to mark unhealthy servers: {}", e);
             }
-            
-            if let Err(e) = db.cleanup_stale_agents(&config.server_id, config.agent_timeout_ms).await {
-                error!("Failed to cleanup stale agents: {}", e);
+
+            if let Err(e) = agent_registry.cleanup_stale(config.agent_timeout_ms as i64).await {
+                error!("Failed to cleanup stale agents from registry: {}", e);
             }
+
+            if let Err(e) = db.cleanup_stale_agents(&config.server_id, config.agent_timeout_ms).await {
+                error!("Failed to cleanup stale agents from database: {}", e);
+            }
+
+            let count = agent_registry.count().await;
+            info!("Active agents: {}", count);
         }
     }
     

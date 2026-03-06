@@ -17,6 +17,9 @@ pub enum Error {
     #[error("Subdomain already taken: {0}")]
     SubdomainTaken(String),
 
+    #[error("Bad request: {0}")]
+    BadRequest(String),
+
     #[error("Invalid API key")]
     InvalidApiKey,
 

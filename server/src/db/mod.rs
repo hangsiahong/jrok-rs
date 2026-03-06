@@ -4,8 +4,8 @@ pub use models::*;
 
 use crate::error::{Error, Result};
 use libsql::{params, Connection, Builder};
-use std::time::Duration;
 use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 const MIGRATION_SQL: &str = include_str!("../../migrations/001_init.sql");
 
@@ -141,7 +141,7 @@ impl Db {
             )
             .await?;
         
-        Ok(result.rows_affected() > 0)
+        Ok(result > 0)
     }
     
     pub async fn renew_leadership(&self, server_id: &str, now: i64) -> Result<bool> {
@@ -152,7 +152,7 @@ impl Db {
             )
             .await?;
         
-        Ok(result.rows_affected() > 0)
+        Ok(result > 0)
     }
     
     pub async fn create_api_key(&self, id: &str, key: &str, name: Option<&str>) -> Result<ApiKey> {
@@ -163,7 +163,7 @@ impl Db {
         self.conn
             .execute(
                 "INSERT INTO api_keys (id, key_hash, key_prefix, name, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, key_hash, key_prefix, name, now],
+                params![id, key_hash.clone(), key_prefix.clone(), name, now],
             )
             .await?;
         
@@ -184,10 +184,59 @@ impl Db {
                 params![key_hash],
             )
             .await?;
-        
+
         Ok(rows.next().await?.is_some())
     }
-    
+
+    pub async fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
+        let mut rows = self.conn
+            .query(
+                "SELECT id, key_hash, key_prefix, name, created_at FROM api_keys ORDER BY created_at DESC",
+                params![],
+            )
+            .await?;
+
+        let mut keys = Vec::new();
+        while let Some(row) = rows.next().await? {
+            keys.push(ApiKey {
+                id: row.get::<String>(0)?,
+                key_hash: row.get::<String>(1)?,
+                key_prefix: row.get::<String>(2)?,
+                name: row.get::<Option<String>>(3)?,
+                created_at: row.get::<i64>(4)?,
+            });
+        }
+
+        Ok(keys)
+    }
+
+    pub async fn delete_api_key(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM api_keys WHERE id = ?1",
+                params![id],
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn get_agent_server(&self, subdomain: &str) -> Result<Option<String>> {
+        let mut rows = self.conn
+            .query(
+                "SELECT server_id FROM agents WHERE subdomain = ?1 AND active = 1 ORDER BY connected_at DESC LIMIT 1",
+                params![subdomain],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            let server_id = row.get::<String>(0)?;
+            return Ok(Some(server_id));
+        }
+
+        Ok(None)
+    }
+
     pub async fn get_agent_by_subdomain(&self, subdomain: &str) -> Result<Option<Agent>> {
         let mut rows = self.conn
             .query(
@@ -202,7 +251,7 @@ impl Db {
                 id: row.get::<String>(0)?,
                 subdomain: row.get::<String>(1)?,
                 server_id: row.get::<String>(2)?,
-                tunnel_id: row.get::<String>(3)?,
+                tunnel_id: Some(row.get::<String>(3)?),
                 local_port: row.get::<i64>(4)? as u16,
                 local_host: row.get::<String>(5)?,
                 protocol: Protocol::from(row.get::<String>(6)?.as_str()),
@@ -230,7 +279,7 @@ impl Db {
                 id: row.get::<String>(0)?,
                 subdomain: row.get::<String>(1)?,
                 server_id: row.get::<String>(2)?,
-                tunnel_id: row.get::<String>(3)?,
+                tunnel_id: Some(row.get::<String>(3)?),
                 local_port: row.get::<i64>(4)? as u16,
                 local_host: row.get::<String>(5)?,
                 protocol: Protocol::from(row.get::<String>(6)?.as_str()),
@@ -263,18 +312,18 @@ impl Db {
                     active = 1
                 WHERE subdomain = ?2",
                 params![
-                    agent.id,
-                    agent.subdomain,
-                    agent.server_id,
-                    agent.tunnel_id,
+                    agent.id.clone(),
+                    agent.subdomain.clone(),
+                    agent.server_id.clone(),
+                    agent.tunnel_id.clone(),
                     agent.local_port as i64,
-                    agent.local_host,
+                    agent.local_host.clone(),
                     agent.protocol.to_string(),
-                    agent.connection_token,
+                    agent.connection_token.clone(),
                     agent.connected_at,
                     now,
                     now,
-                    agent.subdomain,
+                    agent.subdomain.clone(),
                 ],
             )
             .await?;
@@ -316,7 +365,7 @@ impl Db {
     }
     
     pub async fn cleanup_stale_agents(&self, server_id: &str, timeout_ms: u64) -> Result<u64> {
-        let cutoff = current_time_ms() - timeout_ms;
+        let cutoff = current_time_ms() - timeout_ms as i64;
         
         let result = self.conn
             .execute(
@@ -325,7 +374,7 @@ impl Db {
             )
             .await?;
         
-        Ok(result.rows_affected())
+        Ok(result)
     }
     
     pub async fn create_tunnel(&self, tunnel: &Tunnel) -> Result<()> {
@@ -342,15 +391,15 @@ impl Db {
                     active = 1
                 WHERE subdomain = ?2",
                 params![
-                    tunnel.id,
-                    tunnel.subdomain,
+                    tunnel.id.clone(),
+                    tunnel.subdomain.clone(),
                     tunnel.protocol.to_string(),
                     tunnel.tcp_port.map(|p| p as i64),
-                    tunnel.api_key_id,
+                    tunnel.api_key_id.clone(),
                     now,
                     now,
                     now,
-                    tunnel.subdomain,
+                    tunnel.subdomain.clone(),
                 ],
             )
             .await?;
@@ -372,8 +421,8 @@ impl Db {
                 id: row.get::<String>(0)?,
                 subdomain: row.get::<String>(1)?,
                 protocol: Protocol::from(row.get::<String>(2)?.as_str()),
-                tcp_port: row.get::<i64>(3)?.map(|p| p as u16),
-                api_key_id: row.get::<String>(4)?,
+                tcp_port: row.get::<Option<i64>>(3)?.map(|p| p as u16),
+                api_key_id: row.get::<Option<String>>(4)?,
                 created_at: row.get::<i64>(5)?,
                 updated_at: row.get::<i64>(6)?,
                 active: row.get::<i64>(7)? != 0,
@@ -418,20 +467,25 @@ impl Db {
 fn current_time_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
+        .map_err(|e| Error::Internal(format!("Time error: {}", e)))
         .unwrap()
         .as_millis() as i64
 }
 
 fn hash_api_key(key: &str) -> String {
+    use base64::Engine;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    
-    let mut mac = Hmac::<Sha256>::new_from_slice(b"jrok-api-key-v1").unwrap();
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"jrok-api-key-v1")
+        .map_err(|e| Error::Internal(format!("HMAC error: {}", e)))
+        .unwrap();
     mac.update(key.as_bytes());
     let result = mac.finalize();
     base64::engine::general_purpose::STANDARD.encode(result.into_bytes())
 }
 
+#[allow(dead_code)]
 fn key_prefix(key: &str) -> String {
     key.chars().take(8).collect()
 }

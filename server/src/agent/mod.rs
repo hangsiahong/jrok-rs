@@ -2,35 +2,30 @@ mod registry;
 
 pub use registry::*;
 
-use crate::db::Db;
-use crate::error::Result;
+use crate::cluster::Cluster;
+use crate::db::{Db, Protocol};
 use crate::proto::Message;
 use axum::{
-    extract::{ws::WebSocket, State, WebSocketUpgrade},
+    extract::{ws::{WebSocket, Message as WsMessage}, State, WebSocketUpgrade},
     response::Response,
 };
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
-use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
+use std::pin::pin;
 
 pub async fn handle_agent_ws(
     ws: WebSocketUpgrade,
-    State(state): State<Arc<AgentState>>,
+    State((registry, db, _cluster)): State<(Arc<registry::AgentRegistry>, Arc<Db>, Arc<Cluster>)>,
 ) -> Response {
-    ws.on_upgrade(|socket| handle_agent_connection(socket, state))
+    ws.on_upgrade(|socket| handle_agent_connection(socket, registry, db))
 }
 
-struct AgentState {
-    registry: AgentRegistry,
-    db: Db,
-}
-
-async fn handle_agent_connection(socket: WebSocket, state: Arc<AgentState>) {
-    let (tx, rx) = socket.split();
+async fn handle_agent_connection(socket: WebSocket, registry: Arc<registry::AgentRegistry>, db: Arc<Db>) {
+    let (mut tx, rx) = socket.split();
     
     let mut agent_id: Option<String> = None;
-    let heartbeat_timeout_ms = 30_000;
+    let _heartbeat_timeout_ms = 30_000;
     
     let (msg_tx, msg_rx) = tokio::sync::mpsc::channel::<Message>(100);
     
@@ -44,32 +39,51 @@ async fn handle_agent_connection(socket: WebSocket, state: Arc<AgentState>) {
             }
         }
     });
-    
-    let mut rx = rx.filter_map(|msg| async {
+
+    let rx = rx.filter_map(|msg| async {
         match msg {
-            axum::extract::ws::Message::Text(text) => Some(text),
+            Ok(WsMessage::Text(text)) => Some(text),
             _ => None,
         }
     });
-    
-    while let Some(Ok(msg)) = rx.next().await {
-        match serde_json::from_str(&msg) {
-            Message::Register { subdomain, local_port, local_host, protocol } => {
-                match state.registry.register(
+    let mut rx = pin!(rx);
+
+    while let Some(msg) = rx.next().await {
+        match serde_json::from_str::<Message>(&msg) {
+            Ok(Message::Register { subdomain, local_port, local_host, protocol, api_key }) => {
+                // Validate API key
+                match db.validate_api_key(&api_key).await {
+                    Ok(true) => {},
+                    Ok(false) => {
+                        error!("Invalid API key for agent registration");
+                        let _ = msg_tx.send(Message::Error {
+                            message: "Invalid API key".to_string(),
+                        }).await;
+                        return;
+                    }
+                    Err(e) => {
+                        error!("API key validation error: {}", e);
+                        let _ = msg_tx.send(Message::Error {
+                            message: "Authentication failed".to_string(),
+                        }).await;
+                        return;
+                    }
+                }
+
+                match registry.register(
                     subdomain.clone(),
                     local_port,
                     local_host,
-                    protocol,
-                    msg_tx.clone(),
+                    Protocol::from(protocol.as_str()),
                 ).await {
-                    Ok(id) => {
+                    Ok((id, _tx)) => {
                         agent_id = Some(id.clone());
                         let welcome = Message::Welcome {
                             agent_id: id,
                             subdomain,
                             protocol: protocol.to_string(),
                         };
-                        if let Ok(json) = serde_json::to_string(&welcome) {
+                        if let Ok(_json) = serde_json::to_string(&welcome) {
                             let _ = msg_tx.send(welcome).await;
                         }
                     }
@@ -82,33 +96,38 @@ async fn handle_agent_connection(socket: WebSocket, state: Arc<AgentState>) {
                     }
                 }
             }
-            Message::Heartbeat => {
+            Ok(Message::Heartbeat) => {
                 if let Some(ref id) = agent_id {
-                    let _ = state.registry.updateHeartbeat(&id).await;
+                    let _ = registry.update_heartbeat(id).await;
                 }
             }
-            Message::HttpResponse { request_id, status, headers, body } => {
-                if let Some(ref id) = agent_id {
-                    let _ = state.registry.handle_response(&id, request_id, status, headers, body).await;
+            Ok(Message::HttpResponse { request_id, status, headers, body }) => {
+                if let Some(ref _id) = agent_id {
+                    use base64::Engine;
+                    let body_str = body.map(|b| base64::engine::general_purpose::STANDARD.encode(b));
+                    let _ = registry.handle_response(request_id, status, headers, body_str).await;
                 }
             }
-            Message::TcpConnect { connection_id, client_ip } => {
+            Ok(Message::TcpConnect { connection_id, client_ip }) => {
                 if let Some(ref id) = agent_id {
                     debug!("Agent {} TCP connect: {} from {}", id, connection_id, client_ip);
                 }
             }
-            Message::TcpData { connection_id, data } => {
+            Ok(Message::TcpData { connection_id, data: _data }) => {
                 if let Some(ref _id) = agent_id {
                     debug!("TCP data for connection {}", connection_id);
                 }
             }
-            Message::TcpDisconnect { connection_id } => {
+            Ok(Message::TcpDisconnect { connection_id }) => {
                 if let Some(ref _id) = agent_id {
                     debug!("TCP disconnect for connection {}", connection_id);
                 }
             }
-            _ => {
+            Ok(_) => {
                 warn!("Unknown message type");
+            }
+            Err(e) => {
+                error!("Failed to parse message: {}", e);
             }
         }
     }

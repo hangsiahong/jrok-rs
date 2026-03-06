@@ -100,6 +100,7 @@ async fn try_connect(
         "local_port": port,
         "local_host": host,
         "protocol": protocol,
+        "api_key": api_key,
     });
     
     ws.send(WsMessage::Text(register_msg)).await?;

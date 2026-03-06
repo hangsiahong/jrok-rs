@@ -6,8 +6,11 @@ pub struct Config {
     pub http_host: String,
     pub http_port: u16,
     pub tcp_host: String,
+    #[allow(dead_code)]
     pub tcp_port_start: u16,
+    #[allow(dead_code)]
     pub tcp_port_end: u16,
+    #[allow(dead_code)]
     pub base_domain: String,
     pub turso_url: String,
     pub turso_token: String,
@@ -52,6 +55,7 @@ impl Config {
         }
     }
 
+    #[allow(dead_code)]
     pub fn tcp_port_range(&self) -> std::ops::Range<u16> {
         self.tcp_port_start..self.tcp_port_end
     }
