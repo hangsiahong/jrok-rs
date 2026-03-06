@@ -44,3 +44,4 @@ stun-client = "0.1"
 [dev-dependencies]
 tokio-test = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
+futures = "0.3"

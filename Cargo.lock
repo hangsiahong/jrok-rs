@@ -1355,6 +1355,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "dotenv",
+ "futures",
  "futures-util",
  "hmac",
  "http-body-util",

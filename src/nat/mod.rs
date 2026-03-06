@@ -2,9 +2,33 @@
 // This module enables direct connections between clients and agents behind NATs
 
 use crate::error::Result;
-use std::net::{SocketAddr, Ipv4Addr};
+use std::net::{SocketAddr, Ipv4Addr, UdpSocket};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+
+/// Public endpoint discovered via STUN (internal)
+#[derive(Debug, Clone)]
+struct PublicEndpointDiscovered {
+    pub public_ip: String,
+    pub public_port: u16,
+    pub stun_server: String,
+}
+
+// Helper trait for random transaction ID generation
+trait Random: Sized {
+    fn random() -> Self;
+}
+
+impl Random for [u8; 12] {
+    fn random() -> Self {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let mut arr = [0u8; 12];
+        rng.fill(&mut arr);
+        arr
+    }
+}
 
 /// Check if IP address is private (RFC 1918)
 pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
@@ -86,7 +110,165 @@ impl NatDetector {
     pub async fn detect(&self, bind_addr: &str) -> Result<NatInfo> {
         info!("Starting NAT detection from {}", bind_addr);
 
-        // Parse the address to determine NAT type
+        // Try STUN discovery with each server
+        for stun_server_addr in &self._stun_servers {
+            match self.try_stun_discovery(stun_server_addr, bind_addr) {
+                Ok(endpoint) => {
+                    // Determine NAT type by comparing local vs public
+                    let local_addr: SocketAddr = bind_addr.parse()
+                        .map_err(|e| crate::error::Error::Internal(format!("Invalid address: {}", e)))?;
+
+                    let nat_type = if local_addr.ip().to_string() == endpoint.public_ip {
+                        NatType::Open
+                    } else {
+                        // STUN succeeded but IPs differ - we're behind NAT
+                        // For simplicity, assume symmetric (most restrictive)
+                        // In production, would run additional STUN tests
+                        NatType::Symmetric
+                    };
+
+                    let hairpinning = false; // Would need additional STUN test
+
+                    return Ok(NatInfo {
+                        local_addr: bind_addr.to_string(),
+                        public_ip: endpoint.public_ip,
+                        public_port: endpoint.public_port,
+                        nat_type,
+                        hairpinning,
+                    });
+                }
+                Err(e) => {
+                    warn!("STUN server {} failed: {}", stun_server_addr, e);
+                    continue;
+                }
+            }
+        }
+
+        // If all STUN servers fail, fallback to IP-based detection
+        warn!("All STUN servers failed, falling back to IP-based detection");
+        self.detect_by_ip(bind_addr).await
+    }
+
+    /// Try STUN discovery with a specific server
+    fn try_stun_discovery(&self, stun_server_addr: &str, bind_addr: &str) -> Result<PublicEndpointDiscovered> {
+        let server_addr: SocketAddr = stun_server_addr.parse()
+            .map_err(|_| crate::error::Error::Internal(format!("Invalid STUN server address: {}", stun_server_addr)))?;
+
+        // Bind UDP socket
+        let socket = UdpSocket::bind(bind_addr)
+            .map_err(|e| crate::error::Error::Internal(format!("Failed to bind UDP socket: {}", e)))?;
+
+        // Set timeout
+        socket.set_read_timeout(Some(Duration::from_secs(3)))
+            .map_err(|e| crate::error::Error::Internal(format!("Failed to set socket timeout: {}", e)))?;
+
+        // Create STUN binding request
+        let request = self.create_stun_request();
+
+        // Send request
+        socket.send_to(&request, server_addr)
+            .map_err(|e| crate::error::Error::Internal(format!("Failed to send STUN request: {}", e)))?;
+
+        debug!("Sent STUN request to {}", server_addr);
+
+        // Receive response
+        let mut buffer = [0u8; 1024];
+        let (len, _from) = socket.recv_from(&mut buffer)
+            .map_err(|e| crate::error::Error::Internal(format!("Failed to receive STUN response: {}", e)))?;
+
+        debug!("Received STUN response ({} bytes)", len);
+
+        // Parse STUN response
+        self.parse_stun_response(&buffer[..len], stun_server_addr)
+    }
+
+    /// Create STUN binding request
+    fn create_stun_request(&self) -> Vec<u8> {
+        let mut request = Vec::new();
+
+        // STUN message header (20 bytes)
+        // Message type: Binding Request (0x0001)
+        request.extend_from_slice(&0x0001u16.to_be_bytes());
+        // Message length: 0 (no attributes in request)
+        request.extend_from_slice(&0x0000u16.to_be_bytes());
+        // Magic cookie
+        request.extend_from_slice(&0x2112A442u32.to_be_bytes());
+        // Transaction ID (96 bits) - random
+        let transaction_id: [u8; 12] = rand::random();
+        request.extend_from_slice(&transaction_id);
+
+        request
+    }
+
+    /// Parse STUN binding response
+    fn parse_stun_response(&self, response: &[u8], stun_server: &str) -> Result<PublicEndpointDiscovered> {
+        if response.len() < 20 {
+            return Err(crate::error::Error::Internal(
+                "STUN response too short".to_string()
+            ));
+        }
+
+        // Parse header
+        let _msg_type = u16::from_be_bytes([response[0], response[1]]);
+        let _msg_len = u16::from_be_bytes([response[2], response[3]]) as usize;
+        let magic_cookie = u32::from_be_bytes([response[4], response[5], response[6], response[7]]);
+
+        // Verify magic cookie
+        if magic_cookie != 0x2112A442 {
+            return Err(crate::error::Error::Internal(
+                "Invalid STUN magic cookie".to_string()
+            ));
+        }
+
+        // Parse attributes (simplified - just look for MAPPED-ADDRESS)
+        let mut public_ip = None;
+        let mut public_port = None;
+
+        // Simple search for mapped address attribute (0x0001)
+        let mut i = 20;
+        while i < response.len() {
+            if i + 4 > response.len() {
+                break;
+            }
+
+            let attr_type = u16::from_be_bytes([response[i], response[i + 1]]);
+            let attr_len = u16::from_be_bytes([response[i + 2], response[i + 3]]) as usize;
+            i += 4;
+
+            if attr_type == 0x0001 && attr_len >= 8 {
+                // MAPPED-ADDRESS found
+                // Format: family (1) + port (2) + IP (4)
+                let port = u16::from_be_bytes([response[i + 3], response[i + 4]]);
+                let ip_bytes = &response[i + 5..i + 9];
+                public_ip = Some(format!("{}.{}.{}", ip_bytes[0], ip_bytes[1], ip_bytes[2]));
+                public_port = Some(port);
+                break;
+            }
+
+            // Move to next attribute (4-byte aligned)
+            i += (attr_len + 3) & !3;
+        }
+
+        match (public_ip, public_port) {
+            (Some(ip), Some(port)) => {
+                Ok(PublicEndpointDiscovered {
+                    public_ip: ip,
+                    public_port: port,
+                    stun_server: stun_server.to_string(),
+                })
+            }
+            _ => {
+                Err(crate::error::Error::Internal(
+                    "No mapped address in STUN response".to_string()
+                ))
+            }
+        }
+    }
+
+    /// Fallback IP-based detection (when STUN fails)
+    async fn detect_by_ip(&self, bind_addr: &str) -> Result<NatInfo> {
+        warn!("Using fallback IP-based NAT detection");
+
         let addr: SocketAddr = bind_addr.parse()
             .map_err(|e| crate::error::Error::Internal(format!("Invalid address: {}", e)))?;
 
@@ -120,6 +302,14 @@ impl Default for NatDetector {
 /// Hole punching coordinator
 pub struct HolePuncher {
     nat_detector: NatDetector,
+}
+
+/// Strategy for hole punching
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HolePunchStrategy {
+    Direct,
+    HolePunch,
+    Relay,
 }
 
 impl HolePuncher {
@@ -163,7 +353,7 @@ impl HolePuncher {
     }
 
     /// Determine hole punching strategy
-    fn determine_strategy(&self, local_nat: &NatType, remote_nat: &NatType) -> HolePunchStrategy {
+    pub fn determine_strategy(&self, local_nat: &NatType, remote_nat: &NatType) -> HolePunchStrategy {
         match (local_nat, remote_nat) {
             (NatType::Open, _) | (_, NatType::Open) => {
                 // At least one endpoint has public IP
@@ -188,14 +378,46 @@ impl HolePuncher {
     async fn perform_hole_punch(&self, local_nat: &NatInfo, remote_public: &str) -> Result<String> {
         info!("Hole punching from {} to {}", local_nat.local_addr, remote_public);
 
-        // For now, this is a simplified hole punching implementation
-        // In production, would use actual UDP sockets to send punch packets
-        // The client and agent would need to coordinate punch packet timing
+        // Parse remote address
+        let remote_addr: SocketAddr = remote_public.parse()
+            .map_err(|e| crate::error::Error::Internal(format!("Invalid remote address: {}", e)))?;
 
-        // Simulate hole punching delay
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Create UDP socket
+        let socket = UdpSocket::bind(&local_nat.local_addr)
+            .map_err(|e| crate::error::Error::Internal(format!("Failed to bind UDP socket: {}", e)))?;
 
-        info!("Hole punching completed, endpoint should be accessible");
+        // Set timeout to avoid hanging
+        socket.set_write_timeout(Some(Duration::from_secs(5)))
+            .map_err(|e| crate::error::Error::Internal(format!("Failed to set socket timeout: {}", e)))?;
+
+        // Send punch packets
+        let punch_count = 5;
+        let punch_interval = Duration::from_millis(200);
+
+        for i in 0..punch_count {
+            debug!("Sending punch packet {}/{} to {}", i + 1, punch_count, remote_public);
+
+            // Send small punch packet to open NAT mapping
+            let punch_packet = [0u8; 4]; // Small packet
+
+            match socket.send_to(&punch_packet, remote_addr) {
+                Ok(bytes_sent) => {
+                    debug!("Sent {} bytes as punch packet to {}", bytes_sent, remote_public);
+                }
+                Err(e) => {
+                    warn!("Failed to send punch packet {}: {}", i + 1, e);
+                }
+            }
+
+            // Wait before sending next punch packet
+            tokio::time::sleep(punch_interval).await;
+        }
+
+        info!(
+            "Completed UDP hole punching: {} packets sent to {}",
+            punch_count, remote_public
+        );
+
         Ok(remote_public.to_string())
     }
 }
@@ -204,13 +426,6 @@ impl Default for HolePuncher {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum HolePunchStrategy {
-    Direct,
-    HolePunch,
-    Relay,
 }
 
 #[cfg(test)]

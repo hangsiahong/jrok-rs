@@ -12,5 +12,6 @@ pub mod error;
 pub mod nat;
 pub mod proto;
 pub mod relay;
+pub mod stun;
 pub mod tcp;
 pub mod tunnel;
